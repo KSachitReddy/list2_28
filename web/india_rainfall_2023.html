@@ -492,6 +492,51 @@
   .about-text + .about-text{ margin-top: 10px; }
   .about-text b{ color: var(--ink); font-weight: 600; }
 
+  /* ---------- Satellite panel ---------- */
+  .satellite-frame{
+    position: relative;
+    width: 100%;
+    aspect-ratio: 6 / 5;
+    border-radius: 8px;
+    overflow: hidden;
+    background: var(--ocean);
+    border: 1px solid var(--hairline);
+  }
+  .satellite-frame img{
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    opacity: 0;
+    transition: opacity 0.3s ease;
+  }
+  .satellite-frame img.is-loaded{ opacity: 1; }
+  .satellite-empty{
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+    font-size: 11px;
+    color: var(--ink-muted);
+    padding: 10px;
+    line-height: 1.5;
+    opacity: 0;
+    pointer-events: none;
+    transition: opacity 0.2s ease;
+  }
+  .satellite-frame.is-empty .satellite-empty{ opacity: 1; }
+  .satellite-caption{
+    font-size: 11.5px;
+    color: var(--ink-muted);
+    line-height: 1.5;
+    margin: 12px 0 0;
+    text-align: center;
+  }
+  .satellite-caption b{ color: var(--ink-secondary); font-weight: 600; }
+
   /* ---------- Tooltip ---------- */
   .tooltip{
     position: fixed;
@@ -636,6 +681,15 @@
         <div class="legend-ticks" id="legendTicks"></div>
         <p class="legend-note">Colour follows a square-root scale so light and moderate rain stay readable — most of India's grid sits under 20&nbsp;mm on any given day.</p>
         <div class="drop-key" id="dropKey"></div>
+      </div>
+
+      <div class="panel-card">
+        <h2>Satellite View</h2>
+        <div class="satellite-frame" id="satelliteFrame">
+          <img id="satelliteImg" alt="Satellite image of India for the selected day" />
+          <div class="satellite-empty" id="satelliteEmpty">No satellite image<br>available for this date</div>
+        </div>
+        <p class="satellite-caption" id="satelliteCaption">—</p>
       </div>
 
       <div class="panel-card">
@@ -804,6 +858,35 @@
     var pct = (dayIndex / (N_DAYS - 1)) * 100;
     document.getElementById('scrubPlayed').style.width = pct + '%';
     document.getElementById('scrubPlayhead').style.left = pct + '%';
+
+    updateSatellite(dates[dayIndex]);
+  }
+
+  // ---------------- Satellite panel ----------------
+  // Backed by scripts/download_satellite_images.py's NASA GIBS archive
+  // (data/satellite/india_cloud/<year>/<date>.png, served via /api/satellite/<date>).
+  // Only 2019-2025 has imagery, so dates outside that range (or any day the
+  // downloader never filled in) fall back to the "no image" placeholder.
+  var satelliteImgEl = document.getElementById('satelliteImg');
+  var satelliteFrameEl = document.getElementById('satelliteFrame');
+  var satelliteCaptionEl = document.getElementById('satelliteCaption');
+  var satelliteRequestId = 0;
+
+  function updateSatellite(dateStr){
+    // Guards against out-of-order responses while scrubbing/playing fast.
+    var requestId = ++satelliteRequestId;
+    satelliteImgEl.classList.remove('is-loaded');
+    satelliteFrameEl.classList.remove('is-empty');
+    satelliteImgEl.onload = function(){
+      if (requestId !== satelliteRequestId) return;
+      satelliteImgEl.classList.add('is-loaded');
+    };
+    satelliteImgEl.onerror = function(){
+      if (requestId !== satelliteRequestId) return;
+      satelliteFrameEl.classList.add('is-empty');
+    };
+    satelliteImgEl.src = 'api/satellite/' + dateStr;
+    satelliteCaptionEl.innerHTML = 'NASA GIBS (MODIS/VIIRS true-colour) · <b>' + dateStr + '</b>';
   }
 
   // ---------------- Overlay animation loop ----------------
@@ -1141,7 +1224,7 @@
   }
 
   // ---------------- Drawer: year selector ----------------
-  // The button list mirrors whatever is actually in "nc files/" on the
+  // The button list mirrors whatever is actually in "data/nc/" on the
   // server (fetched from /api/years), so an uploaded file's year shows up
   // here automatically once it's been saved.
   var FALLBACK_YEARS = [2019, 2020, 2021, 2022, 2023, 2024, 2025];
