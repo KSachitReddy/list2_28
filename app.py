@@ -30,6 +30,7 @@ Local server for Nimbus -- AI Predictive Weather Analysis.
                                 given the running conversation and an optional
                                 'model' override.
 """
+import json
 import os
 import re
 import tempfile
@@ -57,6 +58,16 @@ DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 def _find_nc_for_year(year):
     matches = sorted(NC_DIR.glob(f"*{year}*.nc"))
     return matches[0] if matches else None
+
+
+@app.errorhandler(404)
+@app.errorhandler(405)
+def api_json_errors(e):
+    """API clients get JSON errors (e.g. /api/year/abc, /api/unknown, GET on a
+    POST-only route); page routes keep Flask's default HTML error page."""
+    if request.path.startswith("/api/"):
+        return jsonify({"error": f"{e.name}: {request.method} {request.path}"}), e.code
+    return e
 
 
 @app.route("/")
@@ -93,13 +104,17 @@ def api_year(year):
 
 @app.route("/api/satellite/<date_str>")
 def api_satellite(date_str):
+    # The regex also keeps anything path-like out of the file lookup below.
     if not DATE_RE.match(date_str):
-        return jsonify({"error": "Invalid date, expected YYYY-MM-DD."}), 400
+        return jsonify({"error": f"Couldn't parse the date '{date_str}' -- expected YYYY-MM-DD."}), 400
+    _, error = chatbot.parse_date(date_str)
+    if error:
+        return jsonify(error), 400
 
     year_dir = SATELLITE_DIR / date_str[:4]
     filename = f"{date_str}.png"
     if not (year_dir / filename).exists():
-        return jsonify({"error": f"No satellite image for {date_str}."}), 404
+        return jsonify({"error": f"No satellite image for {date_str} -- run `nimbus download` to fetch imagery."}), 404
 
     return send_from_directory(year_dir, filename)
 
@@ -146,6 +161,13 @@ def api_nowcast():
     result = predict_nowcast()
     if "error" in result:
         return jsonify(result), 400
+
+    # Attach the held-out 2025 backtest error per region, so the map can show
+    # how far off each number typically is rather than presenting it as exact.
+    metrics_path = BASE_DIR / "models" / "nowcast_model_metrics.json"
+    if metrics_path.exists():
+        test = json.loads(metrics_path.read_text()).get("by_split", {}).get("test_2025", {})
+        result["test_mae_by_region"] = {r: m["mae"] for r, m in test.items()}
     return jsonify(result)
 
 
@@ -225,7 +247,9 @@ def main():
     # every other request -- the dev server is single-threaded by default.
     # use_reloader=False: the stat-reloader forks a second full process (double
     # the RAM) to watch for file changes, not worth it on a memory-constrained machine.
-    app.run(debug=True, port=5050, threaded=True, use_reloader=False)
+    # debug is opt-in (NIMBUS_DEBUG=1): the Werkzeug debugger allows arbitrary
+    # code execution from the browser, so it must never be on by default.
+    app.run(debug=os.environ.get("NIMBUS_DEBUG") == "1", port=5050, threaded=True, use_reloader=False)
 
 
 if __name__ == "__main__":

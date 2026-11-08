@@ -42,6 +42,11 @@ def predict_thermal_rainfall(date_str):
     """Same-day estimated rainfall (mm) per macro-region, from that day's
     thermal satellite image -- or {"error": ...} if there's no trained model
     or no thermal image for that date."""
+    from weather.chatbot import parse_date  # lazy: chatbot pulls in the LLM clients
+
+    _, error = parse_date(date_str)
+    if error:
+        return error
     if not model_available():
         return {"error": "Thermal rainfall estimate model not trained yet -- run scripts/calibrate_thermal_rainfall.py."}
 
@@ -52,7 +57,7 @@ def predict_thermal_rainfall(date_str):
 
     fractions = tf.cold_fractions_multi_threshold(date_str, thresholds)
     if fractions is None:
-        return {"error": f"No thermal satellite image on disk for {date_str}."}
+        return {"error": f"No thermal satellite image on disk for {date_str} -- run `nimbus download` to fetch imagery."}
 
     booster = _load()
     predicted_mm_by_region = {}

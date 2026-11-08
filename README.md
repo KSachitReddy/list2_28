@@ -7,72 +7,104 @@ computed trend/anomaly analysis, and two predictive models — a short-range
 rainfall forecaster and a satellite-imagery-based nowcaster — all reachable
 from a single CLI, `nimbus`.
 
-## Structure
+## Quick start
 
-```
-app.py                   Flask entrypoint — serves the map page, chat page, and their APIs
-cli.py                   The `nimbus` CLI — see "Command line" below
-bootstrap.sh             One-command setup + launch (Linux/Mac)
-bootstrap.ps1            Same, for Windows (PowerShell)
-weather/
-  nc_convert.py           Shared IMD RF25 NetCDF -> CSV/JSON conversion logic
-  chatbot.py               Place gazetteer + rainfall/forecast/nowcast lookup + 3-tier chat pipeline
-  fast_intent.py            Deterministic no-LLM parser for common chatbot questions
-  features.py               Feature engineering for the rainfall forecasting model
-  forecast_model.py         LightGBM rainfall forecaster: train/save/load/predict
-  satellite_features.py     Image/label building for the satellite nowcasting model
-  nowcast_model.py          CNN satellite nowcaster: train/save/load/predict
-  analysis.py                Real computed trend/anomaly stats (SQLite) + live nowcast validation log
-  hardware.py                CPU/RAM/AVX2/swap detection, backing `nimbus setup`
-scripts/
-  convert_all.py           Batch-convert every data/nc/*.nc into data/rainfall/*.csv
-  extract.py                One-off extractor for the 2023 CSV + JSON
-  download_satellite_images.py   Download daily GIBS imagery, 2019-01-01 through yesterday (progress bar)
-  verify_satellite_images.py     Completeness/integrity check over the download
-  retry_failed_dates.py           Re-attempt only the dates verify flagged
-  train_forecast_model.py         Train the rainfall forecaster, print backtested accuracy
-  train_nowcast_model.py          Train the satellite nowcaster, print backtested accuracy
-  generate_forecast_demo.py        Generate a demo rainfall forecast for every gazetteer place
-  generate_nowcast_report.py       Validate the nowcaster against real 2025 rainfall + generate 2026 predictions
-  download_elevation.py           Elevation per grid cell -- terrain isn't used by either model yet
-  download_climate_indices.py     ENSO / IOD / MJO -- large-scale monsoon drivers, not yet used by either model
-  download_era5.py                Atmospheric reanalysis (temp/humidity/wind/pressure) -- needs your own CDS account
-web/
-  weather_map.html          The map page app.py serves
-  chat.html                 The rainfall chatbot page app.py serves
-data/
-  nc/                       Source IMD RF25 NetCDF files (tracked in git)
-  rainfall/                 Generated CSV/JSON rainfall exports (tracked in git)
-  places/                   Offline India states/UTs/cities gazetteer used by the chatbot
-  satellite/                Downloaded GIBS PNGs + logs (gitignored — regenerable, multi-GB)
-  forecast/                 Demo forecast + nowcast validation/prediction CSVs (tracked in git)
-  parameters/               Elevation + climate indices (tracked); ERA5 .nc files (gitignored -- large)
-models/                    Trained models, analysis.db, and metrics JSON (tracked in git — small,
-                           `nimbus sync` keeps this current instead of everyone regenerating locally)
-docs/
-  satellite_images.md       Satellite dataset details: source, format, how to run/resume
-commands.md                Full CLI reference — every command, every option
-```
-
-## Setup
-
-Fastest path -- one command, handles everything below automatically:
+From the repo root, three commands. Needs **Python ≥ 3.12**; uv fetches a matching
+interpreter by itself (`.python-version` pins 3.13, the version everything was tested on).
 
 ```bash
-./bootstrap.sh         # Linux / Mac
-.\bootstrap.ps1         # Windows (PowerShell -- see commands.md if it's blocked by execution policy)
+curl -LsSf https://astral.sh/uv/install.sh | sh          # 1. install uv  (open a new terminal afterwards)
+uv sync --frozen --extra torch                           # 2. install the exact locked dependencies
+uv run nimbus forecast --place Mumbai --date 2026-01-05  # 3. first forecast
 ```
 
-Manual/pip equivalent, if you'd rather not use `uv` or the wrapper script:
+Expected output of step 3:
+
+```
+Mumbai, 2026-01-05: 0.87 mm (ML forecast)
+```
+
+- **Windows:** install uv with
+  `powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"`.
+- **CPU without AVX2** (e.g. Intel 3rd-gen Core or older): drop `--extra torch`.
+  Everything except the satellite nowcaster still works.
+- **Satellite-based answers need imagery**, which isn't in the repo. Until you run
+  `uv run nimbus download` (about 9.6 GB), dates past the short-range ML window fall back
+  to the historical average. `nimbus nowcast`, `nimbus image` and
+  `nimbus thermal-estimate` say no image is on disk.
+- Then `uv run nimbus serve` starts the map and chat at `http://127.0.0.1:5050`. It
+  preloads the models for about 10 s, so the first request is fast.
+
+**Check everything in one go:** `uv run python scripts/quickstart.py` runs steps 2–3
+plus the tests and prints PASS/FAIL per stage. It never commits, pushes or downloads
+imagery.
+
+## Running the tests
 
 ```bash
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+uv run pytest -q
 ```
 
-`requirements.txt` intentionally skips torch (see "Hardware requirements"
-below) -- the map, chatbot, and rainfall forecaster all run without it. Only
-the satellite nowcaster needs it.
+The suite in `tests/` covers:
+- feature leakage, split boundaries and leap-day handling;
+- prediction method labels;
+- API error paths;
+- safe `nimbus sync` defaults;
+- OS hardware detection;
+- missing `uv`/`git` and rate-limited elevation downloads;
+- `requirements.txt` vs `uv.lock` drift.
+
+It runs in about 6 s and needs no imagery or network.
+
+## Project layout
+
+```
+app.py, cli.py     Flask app (map + chat + JSON API) and the `nimbus` CLI
+weather/           forecaster, nowcaster, thermal estimate, features, chatbot, hardware detection
+scripts/           training, evaluation, download and maintenance scripts (listed below)
+web/               the map and chat pages
+data/              rainfall CSV/NetCDF, places, parameters, forecasts; satellite/ fills in via `nimbus download`
+models/            trained models, metrics, forecast_eval_report.json, benchmark.json
+tests/, docs/      pytest suite; changelog, CNN seed stability, satellite notes, screenshots
+```
+
+### Scripts
+
+| Script | Purpose |
+|---|---|
+| `quickstart.py` | Check a fresh setup: uv, dependency sync, tests, first forecast (PASS/FAIL per stage) |
+| `train_forecast_model.py` | Train the LightGBM rainfall forecaster (~1 min) and print backtested accuracy |
+| `train_nowcast_model.py` | Train the satellite CNN nowcaster (needs imagery and torch) |
+| `calibrate_thermal_rainfall.py` | Train the thermal same-day rainfall estimate |
+| `evaluate_forecast.py` | Extended forecaster evaluation -> `models/forecast_eval_report.json` |
+| `benchmark.py` | Latency and memory benchmark -> `models/benchmark.json` |
+| `generate_forecast_demo.py` | Demo forecast for every gazetteer place -> `data/forecast/forecast_demo.csv` |
+| `generate_nowcast_report.py` | Validate the nowcaster on 2025 and generate 2026 predictions |
+| `download_satellite_images.py` | Download daily GIBS true-colour and thermal imagery (what `nimbus download` runs) |
+| `extract_thermal_features.py` | Thermal imagery -> `data/satellite/thermal_features.csv` |
+| `verify_satellite_images.py` | Completeness/integrity check of the downloaded imagery |
+| `retry_failed_dates.py` | Re-download only the dates the verifier flagged |
+| `convert_all.py` | Convert every `data/nc/*.nc` into `data/rainfall/*.csv` |
+| `download_elevation.py` | Elevation per grid cell (not used by the models yet) |
+| `download_climate_indices.py` | ENSO / IOD / MJO indices (not used by the models yet) |
+| `download_era5.py` | ERA5 reanalysis (needs your own CDS account; not used by the models yet) |
+
+## Other ways to install
+
+- **One-command setup with imagery.** `./bootstrap.sh` (Linux/macOS) or
+  `.\bootstrap.ps1` (Windows) runs four steps, stopping at the first failure:
+  `uv sync`, then `nimbus setup --yes` (hardware check, installs torch if safe), then
+  `nimbus sync`, then `nimbus serve`. `nimbus sync` does a fast-forward pull and
+  downloads about 10 GB of imagery. It never commits or pushes; that needs an explicit
+  `nimbus sync --push`, which is for maintainers.
+- **pip.** `requirements.txt` is generated from `uv.lock`. It includes pytest but not
+  torch (see the note at the bottom of the file).
+
+  ```bash
+  python3 -m venv .venv            # Debian/Ubuntu: needs `apt install python3-venv` first
+  .venv/bin/pip install -r requirements.txt
+  .venv/bin/python cli.py forecast --place Mumbai --date 2026-01-05
+  ```
 
 ## Command line
 
@@ -86,21 +118,24 @@ with every option and example: **[commands.md](commands.md)**.
 | `download` | Downloads NASA GIBS satellite imagery (resumable, live progress bar). |
 | `params` | Downloads elevation + ENSO/IOD/MJO climate indices (no account needed) -- see "Weather-prediction parameters" below. |
 | `train` | Trains the rainfall forecaster and/or satellite nowcaster, printing backtested accuracy. |
-| `forecast --place X --date Y` | Rainfall in mm for a place/date -- observed, a real short-range forecast, or an honest climatology estimate, depending how far out. |
+| `forecast --place X [--date Y]` | Rainfall in mm for a place/date (default: today) -- observed, ML forecast, satellite nowcast, thermal estimate, or historical average; every answer says which. |
 | `analyse` | Real computed trend/anomaly statistics (SQLite-backed) -- `--build` to precompute, then `--place X --year Y` or `--place X --trend START END`. |
 | `image --date Y` | Views a downloaded satellite image (prints the path, opens it in your default viewer). |
 | `nowcast` | Runs the satellite CNN directly -- tomorrow's predicted rainfall per macro-region. |
+| `thermal-estimate --date Y` | Same-day rainfall estimate per macro-region from that day's thermal satellite image (needs `download` first). |
 | `chat` | Talk to the AI assistant right in the terminal -- same pipeline as the web chat page. |
-| `sync` | Pulls the latest committed models/analysis, fetches new satellite imagery, validates past nowcast predictions against real data, commits and pushes the result. |
-| `serve` | Launches the Flask app (map + chatbot) at `http://127.0.0.1:5050`. |
+| `sync` | Fast-forward pull + download new satellite imagery. Never commits or pushes. `--push` (maintainers) also refreshes derived state (thermal features, nowcast log, analysis DB), commits and pushes. |
+| `serve` | Preloads the models (~10 s), then launches the Flask app (map + chatbot) at `http://127.0.0.1:5050`. |
 
 ## Hardware requirements
 
 Everything except the satellite nowcaster is designed to run on modest,
-CPU-only hardware, verified across a real range -- from a dual-core Intel
-Ivy Bridge laptop (3rd-gen Core i3, 8 GB RAM) down to ~1GHz-class embedded
-hardware (Raspberry Pi, an old netbook). `nimbus setup` detects which tier
-your machine falls into and configures itself accordingly:
+CPU-only hardware. The intended targets range from a dual-core Intel Ivy Bridge
+laptop (3rd-gen Core i3, 8 GB RAM) down to ~1GHz-class embedded hardware
+(Raspberry Pi, an old netbook). These are intended targets, **not verified in
+final QA**, which ran on a 4-core Intel i5-6500 (AVX2, 7.7 GB RAM) under Linux.
+`nimbus setup` detects which tier your machine falls into and configures itself
+accordingly:
 
 - **CPU**: any x86_64 CPU, or ARM (Raspberry Pi-class). No GPU is used
   anywhere in this project. On ~1GHz-class hardware, train models on a
@@ -108,15 +143,23 @@ your machine falls into and configures itself accordingly:
   training/CNN inference there is impractical, but serving the already-
   trained models is cheap.
 - **RAM**: 8 GB is comfortable for the map, chatbot, and rainfall forecaster.
-  Budget roughly 3-4 GB for `ollama` running the recommended `llama3.2:3b`
-  model if you want the offline chatbot fallback; the rest (Flask, pandas,
-  the LightGBM model) fits in well under 1 GB. On a low-RAM machine, `nimbus
+  Measured peak RSS:
+  - `nimbus serve` and `nimbus forecast`: ~1.9 GB, mostly the cached 14.5M-row
+    rainfall history.
+  - Training the forecaster and `scripts/evaluate_forecast.py`: ~3.7 GB.
+  - Training the CNN: ~2.4 GB.
+  - Budget another 3-4 GB for `ollama` running the recommended `llama3.2:3b`
+    model if you want the offline chatbot fallback.
+  
+  On a 4 GB machine, serving fits only tightly and training needs swap. On a
+  low-RAM machine, `nimbus
   setup` offers to configure swap (Linux, with your confirmation -- it needs
   `sudo`) or gives page-file guidance (Windows, manual -- the mechanism is
   different enough there that this project won't auto-configure it).
 - **Disk**: ~56 MB for the tracked models/analysis database, plus the
-  rainfall CSVs/NetCDFs; add ~7 GB if you download the full satellite
-  imagery archive (optional, only needed for the nowcaster).
+  rainfall CSVs/NetCDFs; add ~9.6 GB if you download the full satellite
+  imagery archive (7.1 GB true-colour + 2.3 GB thermal; optional, only needed
+  for the nowcaster and thermal estimate).
 - **Satellite nowcaster (optional, skip it on older/ARM hardware)**: needs
   PyTorch, which has no 32-bit build and whose CPU wheel has a documented
   history of crashing with "Illegal instruction" on CPUs without AVX2 --
@@ -124,10 +167,13 @@ your machine falls into and configures itself accordingly:
   (Haswell). `nimbus setup` checks for AVX2 and only installs it if safe;
   the rest of the app works fine without it and `/api/nowcast` (or `nimbus
   nowcast`) degrades to a clear error instead of crashing anything.
-- **Windows**: fully supported -- `bootstrap.ps1`, hardware detection, and
-  every CLI command work the same way. Not yet verified on real Windows
-  hardware (built and reviewed carefully, but this project has mostly been
-  run on Linux); if something's off, that's the likeliest place.
+- **Windows**: **partially verified, under Wine only** (no real Windows machine was
+  available). Windows CPython 3.13 installs every pinned wheel from `requirements.txt`,
+  and the Windows-specific code runs: hardware detection through the Win32 API,
+  `nimbus setup`, `nimbus --help`, and `sync` without git. numpy itself can't be
+  imported under Wine 10 (a Wine gap, `ucrtbase.crealf`), so forecasting, the web app
+  and most tests were **not** exercised on Windows. See
+  [docs/final_qa.md](docs/final_qa.md).
 
 ## Running the app
 
@@ -236,6 +282,90 @@ from satellite imagery alone; `nimbus sync` extends this into an ongoing
 check, logging each day's prediction and flagging drift once real data
 catches up to it (see "Keeping everything in sync" below).
 
+## Limitations & honest results
+
+All numbers below are measured on held-out data. Rainfall forecaster figures come from
+`models/forecast_eval_report.json` (`uv run python scripts/evaluate_forecast.py`,
+which first re-checks `forecast_model_metrics.json` exactly). Nowcaster seed figures
+are in `docs/cnn_seed_stability.md`.
+
+**Rainfall forecaster (test 2024–2025)**
+
+- **Skill is small and depends on the metric.** Skill vs climatology on squared
+  error (the number in `forecast_model_metrics.json`) is +0.034 / +0.021 / +0.015 /
+  +0.010 at 1 / 3 / 7 / 14 days. On absolute error it is **negative** at every
+  horizon: −0.040 / −0.047 / −0.050 / −0.050. Bootstrap 95% CIs of the squared-error
+  skill exclude zero (h1 [0.026, 0.043], h14 [0.003, 0.018]). They resample whole
+  dates but ignore day-to-day autocorrelation, so they are somewhat too narrow.
+- **Mostly climatology.** Early stopping kept 28 trees, and `climatology_mm`
+  carries 71% of feature gain. The model beats persistence comfortably (squared-error
+  skill +0.25 at 1 day, +0.48 at 14 days), but persistence is a weak baseline for
+  daily rain.
+- **Heavy rain is badly under-predicted.** On days with ≥50 mm observed (mean 80.2 mm),
+  the 1-day forecast averages 11.6 mm. The largest prediction is 89 mm; the largest
+  observation is 389 mm.
+- **Drizzle bias on dry days.** 70% of target cell-days are exactly 0 mm. The model
+  never predicts below 0.1 mm and averages 2.1 mm on dry days.
+- **Rain/no-rain detection is worse than climatology on CSI.** At ≥1 mm the model's
+  CSI is 0.320 vs climatology's 0.390. At ≥10 mm it is 0.181 vs 0.205, with POD 0.246
+  vs 0.328. Ranking is slightly better (ROC-AUC 0.849 vs 0.831 at ≥1 mm).
+- **Negative in winter.** For December–February, 1-day squared-error skill is
+  −0.025, with a +0.76 mm bias.
+- Rainfall for 2023-10-12 is missing for 79 Gujarat cells. Lag features are
+  positional, so those cells' lags are one day off for the rest of 2023 (the
+  validation year).
+
+**Satellite nowcaster (CNN, test 2025)**
+
+- **West India loses to persistence on every seed.** Squared-error skill vs persistence
+  is −0.385 for the committed seed, and −0.165 and −0.280 for seeds 1 and 2.
+- **Northeast correction.** In the committed metrics, northeast skill vs persistence
+  is +0.140 on **test**. The −0.077 figure is the 2024 **validation** split, and
+  validation northeast is negative on 2 of 3 seeds.
+- **Results move with the seed.** East ranges 0.016–0.161 vs persistence and central
+  0.024–0.173. The committed metrics are a single seed (0).
+- **Climatology is beaten everywhere.** Squared-error skill vs climatology is
+  0.22–0.53 in every region, on every seed.
+- **Small and unregularised.** It has 260,550 parameters (94% in one dense layer) and
+  trains on 1,826 images, with no dropout, batch norm or augmentation. At the best
+  epoch, train MSE (log space) is 0.146 vs validation 0.231.
+
+**Thermal estimate.** Its "climatology" baseline is flat: the region's mean rainfall
+over the split being evaluated, not a day-of-year climatology. Its skill numbers
+therefore aren't comparable to the other two models'.
+
+**Demo forecast.** In `data/forecast/forecast_demo.csv`, 78.1% of rows (5,850 of
+7,488) are `climatology_outlook`. ML forecasts cover only 2026-01-01..14. The CSV
+was generated before forecasts were routed to the satellite models, so the live
+app now returns `satellite_nowcast` for some dates the CSV labels climatology.
+
+**Resources and platforms**
+
+- Peak RAM: the web server and `nimbus forecast` reach about 1.9 GB once forecast
+  data is cached. Forecaster retraining and `evaluate_forecast.py` peak at about
+  3.7 GB, and CNN training at 2.4 GB.
+- Latency: the first forecast request takes about 11 s while 14.5M rows load; after
+  that, the median is about 90 ms (see `models/benchmark.json`).
+- Without torch, the app degrades cleanly (verified in a torch-less environment):
+  `/api/nowcast` returns 503 and forecasts fall back to thermal or climatology.
+- **Not verified:** running on real Windows (only Wine; see
+  [docs/final_qa.md](docs/final_qa.md)), on macOS, and on a real CPU without AVX2.
+- **Torch detection on Windows and Apple Silicon is untested on real hardware.**
+  `nimbus setup` checks AVX2 on Windows with `IsProcessorFeaturePresent`, and treats
+  Apple Silicon as torch-capable (native arm64 wheels). Both paths are unit-tested with
+  simulated platforms only.
+- **`bootstrap.ps1` exit-code checks are untested.** It now stops at the first failing
+  native command (`$LASTEXITCODE` check after each), but it has never been executed:
+  no PowerShell was available in QA.
+
+**App behaviour to be aware of**
+
+- `/api/nowcast` (and the map's nowcast card) needs a satellite image from the last
+  7 days. Run `uv run nimbus download` before a demo.
+- `POST /api/convert` writes the uploaded file to `data/nc/` and **overwrites**
+  `data/rainfall/rainfall_<year>.csv` for that year without confirmation, and that
+  CSV is training/test data. Only upload years you intend to replace.
+
 ## Weather-prediction parameters (not yet used by either model)
 
 Both models above currently see only lat/lon, day-of-year, historical
@@ -288,17 +418,22 @@ Also available via `GET /api/analysis` and as a chatbot tool
 ## Keeping everything in sync
 
 ```bash
-uv run nimbus sync
+uv run nimbus sync          # fast-forward pull + download new imagery; never commits or pushes
+uv run nimbus sync --push   # maintainers only: also refresh derived state, commit and push
 ```
 
-Pulls the latest committed `models/`/`data/forecast/` state, fetches any new
-satellite imagery, logs today's nowcast prediction, checks any
-previously-logged predictions against real rainfall now that it's available
-(flagging drift if live accuracy diverges from the original training
-backtest by more than 25%), refreshes the analysis database, then commits
-and pushes the result back to the repo. Satellite images themselves are
-never committed -- `data/satellite/` stays gitignored; only the small
-derived state goes through git.
+The default is safe to run any time: it runs `git pull --ff-only` and fetches any new
+satellite imagery, and writes no tracked files.
+
+`--push` additionally:
+1. extracts thermal features from the new imagery;
+2. logs today's nowcast prediction;
+3. checks earlier predictions against real rainfall now that it's available, flagging
+   drift if live accuracy diverges from the training backtest by more than 25%;
+4. refreshes the analysis database;
+5. commits `models/`, `data/forecast/` and the thermal features, and pushes.
+
+Satellite images themselves are never committed.
 
 ## Batch-converting rainfall data
 

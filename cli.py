@@ -14,12 +14,14 @@ Unified CLI for Nimbus -- AI Predictive Weather Analysis.
     uv run nimbus image --date 2023-08-15               # view a downloaded satellite image
     uv run nimbus nowcast                               # satellite-based CNN prediction for tomorrow
     uv run nimbus chat                                  # talk to the AI assistant, right in the terminal
-    uv run nimbus sync                                  # pull, fetch new imagery, validate, commit + push
+    uv run nimbus sync                                  # fast-forward + fetch new imagery (never commits)
+    uv run nimbus sync --push                           # maintainers: also refresh derived state, commit + push
     uv run nimbus serve                                 # launch the map + chatbot web app
 """
 import json
 import os
 import platform
+import shutil
 import subprocess
 import sys
 from datetime import date
@@ -84,15 +86,20 @@ def setup(yes):
             click.echo("torch is already installed.")
         except ImportError:
             if yes or click.confirm("Run `uv sync --extra torch` now to enable it?", default=True):
-                subprocess.call(["uv", "sync", "--extra", "torch"])
+                if _call(["uv", "sync", "--extra", "torch"]) == 127:
+                    click.echo(
+                        "Install torch yourself instead (pip install route):\n"
+                        "  pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu"
+                    )
 
     click.echo()
-    ram, swap = info["ram_gb"], info["swap_gb"] or 0
+    ram, swap = info["ram_gb"], info["swap_gb"]
     is_windows = platform.system() == "Windows"
-    if ram is not None and ram <= 8 and swap < 8:
+    swap_name = "page file" if is_windows else "swap"
+    if ram is not None and ram <= 8 and (swap is None or swap < 8):
         click.echo(
-            f"RAM is {ram} GB with only {swap} GB of "
-            + ("page file" if is_windows else "swap")
+            f"RAM is {ram} GB with "
+            + (f"only {swap} GB of {swap_name}" if swap is not None else f"an undetected amount of {swap_name}")
             + ". A low-RAM machine running Ollama and Flask together can hit an "
             "out-of-memory situation with no cushion -- this happened during this "
             "project's own development and took down the IDE, not just the app."
@@ -198,7 +205,7 @@ def train(model):
 @cli.command()
 @click.option("--place", required=True, help="An Indian state, union territory, or city, e.g. 'Kerala'.")
 @click.option(
-    "--date", "date_str", required=True,
+    "--date", "date_str", default=lambda: date.today().isoformat(), show_default="today",
     help="YYYY-MM-DD. Dates already in the historical record (2018-2025) return observed "
          "rainfall; later dates return a forecast.",
 )
@@ -206,6 +213,7 @@ def forecast(place, date_str):
     """Rainfall (mm) for a place on a given date -- observed if it's in the historical
     record, predicted (ML short-range or climatology) otherwise."""
     from weather import chatbot
+    from weather.fast_intent import method_label
 
     result = chatbot.get_weather(place, date_str)
     if "error" in result:
@@ -213,10 +221,9 @@ def forecast(place, date_str):
         raise SystemExit(1)
 
     if "predicted_mm" in result:
-        caveat = "  (rough estimate -- might not be accurate)" if result["method"] == "climatology_outlook" else ""
-        click.echo(f"{result['matched_place']}, {result['target_date']}: {result['predicted_mm']} mm{caveat}")
+        click.echo(f"{result['matched_place']}, {result['target_date']}: {result['predicted_mm']} mm ({method_label(result)})")
     else:
-        click.echo(f"{result['matched_place']}, {result['start_date']}: {result['total_rainfall_mm']} mm")
+        click.echo(f"{result['matched_place']}, {result['start_date']}: {result['total_rainfall_mm']} mm (observed)")
 
 
 @cli.command()
@@ -351,25 +358,38 @@ def chat(model):
 
 
 @cli.command()
-@click.option("--no-push", is_flag=True, help="Commit locally but don't push to the remote.")
-def sync(no_push):
-    """Pull the latest committed models/analysis state, fetch any new
-    satellite imagery, check today's nowcast prediction against real data as
-    it becomes available, refresh the analysis database, then commit (and by
-    default push) the results back to the repo. Run this whenever you open
-    the project.
+@click.option("--push", is_flag=True,
+              help="Maintainer mode: also refresh derived state (thermal features, nowcast log, "
+                   "analysis DB), commit models/, data/forecast/ and thermal features, and push.")
+def sync(push):
+    """Fast-forward to the latest committed state and fetch any new satellite
+    imagery. That's all the default does -- it never writes tracked files,
+    commits, or pushes, so it's safe to run any time.
+
+    With --push (maintainers only): additionally extract thermal features from
+    the new imagery, log today's nowcast prediction, validate earlier ones
+    against real data, refresh the analysis database, then commit and push.
 
     Satellite images themselves are never committed (data/satellite/ stays
-    gitignored -- multi-GB of regenerable PNGs don't belong in git); only the
-    small derived state (models/, data/forecast/) is synced through git.
+    gitignored -- multi-GB of regenerable PNGs don't belong in git).
     """
-    from weather import analysis
+    if push and shutil.which("git") is None:
+        click.echo("Error: --push needs git, which was not found on PATH.", err=True)
+        raise SystemExit(1)
 
-    click.echo("=== Pulling latest committed state ===")
-    subprocess.call(["git", "pull"])
+    click.echo("=== Pulling latest committed state (fast-forward only) ===")
+    if _call(["git", "pull", "--ff-only"]) != 0:
+        click.echo("git pull --ff-only failed (git missing, no remote, or local commits) -- "
+                   "continuing with the local copy.")
 
     click.echo("=== Checking for new satellite imagery ===")
     subprocess.call([sys.executable, str(SCRIPTS_DIR / "download_satellite_images.py")])
+
+    if not push:
+        click.echo("Done. Nothing was committed or pushed (use --push for the maintainer refresh).")
+        return
+
+    from weather import analysis
 
     click.echo("=== Extracting thermal features from any new imagery ===")
     subprocess.call([sys.executable, str(SCRIPTS_DIR / "extract_thermal_features.py")])
@@ -400,18 +420,15 @@ def sync(no_push):
     click.echo(f"{n} place/year/month rows.")
 
     click.echo("=== Committing ===")
-    subprocess.call(["git", "add", "models/", "data/forecast/"])
+    subprocess.call(["git", "add", "models/", "data/forecast/", "data/satellite/thermal_features.csv"])
     commit = subprocess.run(
         ["git", "commit", "-m", f"Automated sync: {date.today().isoformat()}"],
         capture_output=True, text=True,
     )
     click.echo(commit.stdout.strip() or commit.stderr.strip())
     if commit.returncode == 0:
-        if no_push:
-            click.echo("Skipped push (--no-push).")
-        else:
-            click.echo("=== Pushing ===")
-            subprocess.call(["git", "push"])
+        click.echo("=== Pushing ===")
+        subprocess.call(["git", "push"])
 
 
 @cli.command()
@@ -419,7 +436,40 @@ def serve():
     """Launch the Flask map + chatbot web app at http://127.0.0.1:5050."""
     import app
 
+    _warm_up()
     app.main()
+
+
+def _warm_up():
+    """Load the rainfall history and forecaster before serving, so the first
+    forecast request isn't the ~12 s cold one. Only `nimbus serve` does this
+    (importing app stays cheap); a failure here is a warning, not fatal --
+    the app would just load lazily on first request, as before."""
+    import time
+
+    click.echo("Loading rainfall history and models (about 10 s)...")
+    start = time.time()
+    try:
+        from weather import chatbot, features, forecast_model
+
+        features.load_rainfall()  # the full 14.5M-row history -- the slow part
+        if forecast_model.model_available():
+            forecast_model._load()
+        chatbot._last_available_date()
+    except Exception as e:  # noqa: BLE001 -- serving must not depend on the warm-up
+        click.echo(f"Warning: warm-up failed ({e!r}); the first request will be slow.", err=True)
+        return
+    click.echo(f"Models ready ({time.time() - start:.0f} s).")
+
+
+def _call(cmd):
+    """subprocess.call that reports a program missing from PATH (e.g. uv on the
+    pip install route, git in a ZIP download) instead of crashing; returns 127."""
+    try:
+        return subprocess.call(cmd)
+    except FileNotFoundError:
+        click.echo(f"`{cmd[0]}` was not found on PATH.", err=True)
+        return 127
 
 
 def _prompt_date(label="Date", default=None):
@@ -490,8 +540,8 @@ def _menu_chat(ctx):
 
 
 def _menu_sync(ctx):
-    push = click.confirm("Push to remote after committing?", default=True)
-    ctx.invoke(sync, no_push=not push)
+    push = click.confirm("Also refresh derived state, commit and push (maintainers only)?", default=False)
+    ctx.invoke(sync, push=push)
 
 
 def _menu_serve(ctx):
@@ -513,7 +563,7 @@ MENU = [
     ("7", "Nowcast tomorrow's rainfall (CNN)", _menu_nowcast),
     ("8", "Thermal same-day rainfall estimate", _menu_thermal_estimate),
     ("9", "Chat with the AI assistant", _menu_chat),
-    ("10", "Sync (pull, download, validate, commit+push)", _menu_sync),
+    ("10", "Sync (pull + new imagery; optional maintainer commit+push)", _menu_sync),
     ("11", "Serve the web app", _menu_serve),
     ("12", "Hardware setup", _menu_setup),
 ]
